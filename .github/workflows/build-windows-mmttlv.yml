@@ -1,0 +1,316 @@
+name: Build Static FFmpeg MMT-TLV for Windows
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - tlvmmt
+    paths:
+      - ".github/workflows/build-windows-mmttlv.yml"
+      - "configure"
+      - "fftools/**"
+      - "libavcodec/**"
+      - "libavdevice/**"
+      - "libavfilter/**"
+      - "libavformat/**"
+      - "libavutil/**"
+      - "libswresample/**"
+      - "libswscale/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: Build static Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      # ============================================================
+      # 获取otya128/FFmpeg-mmttlv的tlvmmt分支源码
+      # ============================================================
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: tlvmmt
+          fetch-depth: 1
+
+      # ============================================================
+      # 安装MSYS2、MinGW-w64及静态链接库
+      # ============================================================
+      - name: Install MSYS2 and MinGW-w64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            diffutils
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-libiconv
+            mingw-w64-x86_64-winpthreads
+            mingw-w64-x86_64-zlib
+
+      # ============================================================
+      # 配置FFmpeg
+      #
+      # --pkg-config-flags=--static：
+      #   要求pkg-config返回静态库链接参数。
+      #
+      # --extra-ldflags=-static：
+      #   静态链接libiconv、zlib、winpthread等MinGW库。
+      #
+      # --disable-pthreads：
+      #   在Windows下优先使用FFmpeg的原生Win32线程。
+      # ============================================================
+      - name: Configure FFmpeg
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          ./configure \
+            --prefix="$PWD/dist" \
+            --extra-version=mmttlv-static \
+            --arch=x86_64 \
+            --target-os=mingw32 \
+            --disable-debug \
+            --disable-doc \
+            --disable-ffplay \
+            --disable-shared \
+            --enable-static \
+            --pkg-config-flags="--static" \
+            --extra-ldflags="-static -static-libgcc" \
+            --disable-pthreads \
+            --enable-network \
+            --enable-schannel \
+            --enable-demuxer=mmttlv
+
+      # ============================================================
+      # 编译并安装FFmpeg
+      # ============================================================
+      - name: Build FFmpeg
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          make -j"$(nproc)"
+          make install
+
+          # 减小EXE体积
+          strip dist/bin/ffmpeg.exe
+          strip dist/bin/ffprobe.exe
+
+      # ============================================================
+      # 验证MMT/TLV和HTTP/HTTPS支持
+      # ============================================================
+      - name: Verify FFmpeg features
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          echo "FFmpeg version:"
+          ./dist/bin/ffmpeg.exe -version
+
+          echo
+          echo "Checking MMT/TLV demuxer:"
+
+          ./dist/bin/ffmpeg.exe -hide_banner -demuxers \
+            | grep -E '^[[:space:]]*D[[:space:]]+mmttlv([[:space:]]|$)'
+
+          echo
+          echo "Checking HTTP protocol:"
+
+          ./dist/bin/ffmpeg.exe -hide_banner -protocols \
+            | grep -E '^[[:space:]]*http$'
+
+          echo
+          echo "Checking HTTPS protocol:"
+
+          ./dist/bin/ffmpeg.exe -hide_banner -protocols \
+            | grep -E '^[[:space:]]*https$'
+
+      # ============================================================
+      # 检查是否仍然依赖MinGW第三方DLL
+      #
+      # Windows系统DLL仍会存在，例如：
+      # KERNEL32.dll、Secur32.dll、WS2_32.dll等。
+      # 这些DLL由Windows系统提供，不需要打包。
+      # ============================================================
+      - name: Verify static dependencies
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          {
+            echo "=================================================="
+            echo "ffmpeg.exe imported DLLs"
+            echo "=================================================="
+
+            objdump -p dist/bin/ffmpeg.exe \
+              | sed -n 's/.*DLL Name: /DLL: /p'
+
+            echo
+            echo "=================================================="
+            echo "ffprobe.exe imported DLLs"
+            echo "=================================================="
+
+            objdump -p dist/bin/ffprobe.exe \
+              | sed -n 's/.*DLL Name: /DLL: /p'
+          } | tee imported-dlls.txt
+
+          # 检查不应存在的MinGW动态依赖
+          if grep -Ei \
+            'libiconv-2\.dll|libwinpthread-1\.dll|zlib1\.dll|libgcc_s_.*\.dll|libstdc\+\+-6\.dll' \
+            imported-dlls.txt; then
+
+            echo "Unexpected MinGW runtime DLL dependency detected."
+            exit 1
+          fi
+
+          echo "No external MinGW runtime DLL dependency detected."
+
+      # ============================================================
+      # 整理构建结果
+      #
+      # ffmpeg.exe和ffprobe.exe都是独立程序，不需要附带DLL。
+      # ============================================================
+      - name: Prepare artifact
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+
+          mkdir -p artifact
+
+          cp dist/bin/ffmpeg.exe artifact/
+          cp dist/bin/ffprobe.exe artifact/
+
+          cp LICENSE.md artifact/
+          cp COPYING.LGPLv2.1 artifact/
+          cp imported-dlls.txt artifact/
+
+          {
+            echo "=================================================="
+            echo "FFmpeg version"
+            echo "=================================================="
+
+            ./dist/bin/ffmpeg.exe -version
+
+            echo
+            echo "=================================================="
+            echo "MMT/TLV demuxer"
+            echo "=================================================="
+
+            ./dist/bin/ffmpeg.exe -hide_banner -demuxers \
+              | grep -i mmttlv
+
+            echo
+            echo "=================================================="
+            echo "HTTP/HTTPS protocols"
+            echo "=================================================="
+
+            ./dist/bin/ffmpeg.exe -hide_banner -protocols \
+              | grep -E '^[[:space:]]*https?$'
+
+            echo
+            echo "=================================================="
+            echo "Imported Windows DLLs"
+            echo "=================================================="
+
+            cat imported-dlls.txt
+          } > artifact/build-info.txt
+
+          echo "Final artifact contents:"
+          ls -lh artifact
+
+      # ============================================================
+      # 模拟脱离MSYS2的普通Windows环境
+      #
+      # 清除MSYS2目录，只保留Windows系统路径。
+      # 如果仍然缺少第三方DLL，此步骤会失败。
+      # ============================================================
+      - name: Test standalone FFmpeg outside MSYS2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # 只保留Windows系统目录
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+
+          Write-Host "Testing standalone ffmpeg.exe..."
+
+          .\artifact\ffmpeg.exe -version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Standalone ffmpeg.exe failed to start."
+          }
+
+          Write-Host "Testing standalone ffprobe.exe..."
+
+          .\artifact\ffprobe.exe -version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Standalone ffprobe.exe failed to start."
+          }
+
+          Write-Host "Checking MMT/TLV demuxer..."
+
+          $demuxers = .\artifact\ffmpeg.exe `
+            -hide_banner `
+            -demuxers 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query FFmpeg demuxers."
+          }
+
+          $mmttlv = $demuxers |
+            Select-String "mmttlv"
+
+          if (-not $mmttlv) {
+            throw "MMT/TLV demuxer was not found."
+          }
+
+          $mmttlv
+
+          Write-Host "Checking HTTP/HTTPS protocols..."
+
+          $protocols = .\artifact\ffmpeg.exe `
+            -hide_banner `
+            -protocols 2>&1
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query FFmpeg protocols."
+          }
+
+          $http = $protocols |
+            Select-String "^\s*http\s*$"
+
+          if (-not $http) {
+            throw "HTTP protocol was not found."
+          }
+
+          $https = $protocols |
+            Select-String "^\s*https\s*$"
+
+          if (-not $https) {
+            throw "HTTPS protocol was not found."
+          }
+
+          $http
+          $https
+
+      # ============================================================
+      # 上传构建结果
+      # ============================================================
+      - name: Upload static FFmpeg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-mmttlv-static-windows-x64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30
